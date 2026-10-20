@@ -6,18 +6,22 @@ const ALLOWED_HOSTS = ["claude.com", "gc.zgo.at", "github.com", "img.shields.io"
 const REPO_URL = 'https://github.com/turhe123/compress-image-to-kb';
 const DONATION_URL = 'https://ko-fi.com/leodavidai';
 
+// Same-origin = the server under test (local http.server, or the live GitHub Pages URL via BASE_URL).
+const SITE_HOST = new URL(process.env.BASE_URL || 'http://127.0.0.1/').hostname;
+const isSite = (h) => h === SITE_HOST || h === '127.0.0.1' || h === 'localhost';
+
 function watch(page) {
   const state = { consoleErrors: [], pageErrors: [], failed: [], external: [] };
   page.on('console', (m) => { if (m.type() === 'error') state.consoleErrors.push(m.text()); });
   page.on('pageerror', (e) => state.pageErrors.push(String(e)));
-  page.on('requestfailed', (r) => { const u = new URL(r.url()); if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') state.failed.push(r.url()); });
+  page.on('requestfailed', (r) => { const u = new URL(r.url()); if (isSite(u.hostname)) state.failed.push(r.url()); });
   return state;
 }
 
 async function blockExternal(page, state) {
   await page.route('**/*', (route) => {
     const u = new URL(route.request().url());
-    if (u.hostname === '127.0.0.1' || u.hostname === 'localhost') return route.continue();
+    if (isSite(u.hostname)) return route.continue();
     state.external.push(u.hostname);
     if (ALLOWED_HOSTS.includes(u.hostname)) return route.fulfill({ status: 200, contentType: 'application/javascript', body: '' });
     return route.abort();
