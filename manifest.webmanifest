@@ -1,0 +1,17 @@
+{
+  "name": "Compress Image to Exact KB",
+  "short_name": "Compress Ima",
+  "description": "Shrink a photo to a target size like 50, 100 or 200 KB in your browser, with no upload. Free and open source, nothing is uploaded, works offline.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f6f7fb",
+  "theme_color": "#5b4bdb",
+  "categories": ["utilities", "productivity"],
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
