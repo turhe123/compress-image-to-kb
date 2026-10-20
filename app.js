@@ -139,6 +139,8 @@ function validate(file) {
 
 async function addFiles(files) {
   clearAlerts();
+  // Check the settings first so a bad custom target shows one error instead of cards stuck on "working".
+  try { readSettings(); } catch (err) { showError(err.message); return; }
   const added = [];
   for (const file of files) {
     const v = validate(file);
@@ -240,11 +242,12 @@ function showResult(item, result, settings) {
   c.querySelector('.kb-after-size').textContent = `· ${formatBytes(result.blob.size)}`;
 
   const orig = item.file.size;
-  const savedPct = Math.max(0, Math.round((1 - result.blob.size / orig) * 100));
+  const savedPct = Math.round((1 - result.blob.size / orig) * 100); // negative when the file grew
+  const savedText = savedPct >= 0 ? `${savedPct}%` : `grew by ${-savedPct}%`;
   const set = (k, v) => { c.querySelector(`[data-k="${k}"]`).textContent = v; };
   set('orig', `${formatBytes(orig)} (${orig.toLocaleString()} bytes)`);
   set('new', `${formatBytes(result.blob.size)} (${result.blob.size.toLocaleString()} bytes)`);
-  set('saved', `${savedPct}%`);
+  set('saved', savedText);
   set('quality', result.original ? 'Unchanged original' : result.quality == null ? 'Lossless PNG' : `${Math.round(result.quality * 100)}%`);
   set('dims', result.width === result.srcWidth && result.height === result.srcHeight
     ? `${result.width} × ${result.height} px`
@@ -252,14 +255,16 @@ function showResult(item, result, settings) {
   c.querySelector('.kb-stats').hidden = false;
 
   const savedChip = c.querySelector('.kb-card__saved');
-  savedChip.textContent = result.reached ? `−${savedPct}%` : 'Target not reached';
+  savedChip.textContent = !result.reached ? 'Target not reached' : savedPct >= 0 ? `−${savedPct}%` : `+${-savedPct}%`;
   savedChip.classList.toggle('kb-chip--warn', !result.reached);
   savedChip.hidden = false;
 
   const notes = c.querySelector('.kb-notes');
-  notes.replaceChildren(...result.notes.map((n) => { const li = document.createElement('li'); li.textContent = n; return li; }));
+  const noteList = [...result.notes];
+  if (savedPct < 0) noteList.push('The result is larger than the original because it was converted to a different format, but it is still under the target.');
+  notes.replaceChildren(...noteList.map((n) => { const li = document.createElement('li'); li.textContent = n; return li; }));
   notes.classList.toggle('kb-notes--warn', !result.reached);
-  notes.hidden = !result.notes.length;
+  notes.hidden = !noteList.length;
 
   const btn = c.querySelector('.kb-dl');
   btn.textContent = `Download ${item.name}`;

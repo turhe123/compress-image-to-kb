@@ -26,8 +26,109 @@ function encode(canvas, type, quality) {
 }
 
 async function canEncode(type) {
-  const blob = await encode(makeCanvas(1, 1), type, 0.8);
-  return blob.type === type;
+  // The canvas needs a context before it can be encoded (OffscreenCanvas throws otherwise).
+  const c = makeCanvas(1, 1);
+  c.getContext('2d').fillRect(0, 0, 1, 1);
+  try {
+    const blob = await encode(c, type, 0.8);
+    return blob.type === type;
+  } catch {
+    return false;
+  }
+}
+
+/* ---------- Lossless metadata removal for files that are already small enough ---------- */
+
+// Reads the EXIF Orientation tag (1 when absent) from a JPEG APP1 segment body.
+function exifOrientation(seg) {
+  if (seg.length < 18 || String.fromCharCode(...seg.subarray(4, 10)) !== 'Exif\0\0') return 1;
+  const t = seg.subarray(10);
+  const dv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+  const le = t[0] === 0x49;
+  if (dv.getUint16(2, le) !== 42) return 1;
+  const ifd = dv.getUint32(4, le);
+  if (ifd + 2 > t.length) return 1;
+  const n = dv.getUint16(ifd, le);
+  for (let i = 0; i < n; i++) {
+    const e = ifd + 2 + i * 12;
+    if (e + 12 > t.length) break;
+    if (dv.getUint16(e, le) === 0x0112) return dv.getUint16(e + 8, le) || 1;
+  }
+  return 1;
+}
+
+// Drops APP1 (EXIF, XMP), APP13 (IPTC) and comment segments; keeps JFIF, ICC and the picture itself.
+// Returns null when the file has an EXIF rotation, because stripping it would change how the photo shows.
+function stripJpeg(b) {
+  if (b[0] !== 0xff || b[1] !== 0xd8) return null;
+  const parts = [b.subarray(0, 2)];
+  let p = 2, dropped = false;
+  while (p + 4 <= b.length) {
+    if (b[p] !== 0xff) return null;
+    const m = b[p + 1];
+    if (m === 0xff) { p++; continue; }
+    if (m === 0xd8 || m === 0x01 || (m >= 0xd0 && m <= 0xd7)) { parts.push(b.subarray(p, p + 2)); p += 2; continue; }
+    if (m === 0xda) { parts.push(b.subarray(p)); return { parts, dropped }; }
+    const len = (b[p + 2] << 8) | b[p + 3];
+    if (len < 2 || p + 2 + len > b.length) return null;
+    const seg = b.subarray(p, p + 2 + len);
+    if (m === 0xe1 && exifOrientation(seg) !== 1) return null;
+    if (m === 0xe1 || m === 0xed || m === 0xfe) dropped = true;
+    else parts.push(seg);
+    p += 2 + len;
+  }
+  return null;
+}
+
+// Drops text, time and EXIF chunks from a PNG.
+function stripPng(b) {
+  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+  if (b.length < 8 || sig.some((v, i) => b[i] !== v)) return null;
+  const parts = [b.subarray(0, 8)];
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let p = 8, dropped = false;
+  while (p + 12 <= b.length) {
+    const len = dv.getUint32(p);
+    const type = String.fromCharCode(b[p + 4], b[p + 5], b[p + 6], b[p + 7]);
+    const end = p + 12 + len;
+    if (end > b.length) return null;
+    if (type === 'eXIf') return null; // may carry an orientation: re-encode instead
+    if (type === 'tEXt' || type === 'zTXt' || type === 'iTXt' || type === 'tIME') dropped = true;
+    else parts.push(b.subarray(p, end));
+    if (type === 'IEND') return { parts, dropped };
+    p = end;
+  }
+  return null;
+}
+
+// WebP: metadata lives in EXIF / XMP chunks; if present, re-encode (the EXIF may rotate the picture).
+function checkWebp(b) {
+  if (b.length < 12 || String.fromCharCode(...b.subarray(0, 4)) !== 'RIFF' || String.fromCharCode(...b.subarray(8, 12)) !== 'WEBP') return null;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let p = 12;
+  while (p + 8 <= b.length) {
+    const fourcc = String.fromCharCode(...b.subarray(p, p + 4));
+    if (fourcc === 'EXIF' || fourcc === 'XMP ') return null;
+    const len = dv.getUint32(p + 4, true);
+    p += 8 + len + (len & 1);
+  }
+  return { parts: [b], dropped: false };
+}
+
+/**
+ * Removes metadata from an image file without touching its pixels. Returns { blob, dropped } or null
+ * when that is not possible (unknown container, or EXIF data that rotates the image), in which case the
+ * caller re-encodes through the canvas, which drops everything.
+ */
+async function stripMetadata(file) {
+  const b = new Uint8Array(await file.arrayBuffer());
+  let r = null;
+  if (b[0] === 0xff && b[1] === 0xd8) r = stripJpeg(b);
+  else if (b[0] === 0x89 && b[1] === 0x50) r = stripPng(b);
+  else if (b[0] === 0x52 && b[1] === 0x49) r = checkWebp(b);
+  else if ((b[0] === 0x47 && b[1] === 0x49) || (b[0] === 0x42 && b[1] === 0x4d)) r = { parts: [b], dropped: false }; // GIF / BMP carry no EXIF
+  if (!r) return null;
+  return { blob: r.dropped ? new Blob(r.parts, { type: file.type }) : file, dropped: r.dropped };
 }
 
 async function sniff(file) {
@@ -77,9 +178,17 @@ export async function compressImage(file, s, onProgress = () => {}) {
   // Already small enough and no conversion asked for: hand back the original untouched.
   const sameType = type === file.type || (s.format === 'original' && !info.isGif);
   const noResizeLock = !(s.maxWidth && srcW > s.maxWidth) && !(s.maxHeight && srcH > s.maxHeight);
+  // Metadata (EXIF, GPS, comments) is still removed, losslessly, so the promise holds for every result.
   if (file.size <= s.targetBytes && sameType && noResizeLock && srcW * srcH <= HUGE_PIXELS) {
-    bitmap.close?.();
-    return { blob: file, type: file.type, width: srcW, height: srcH, srcWidth: srcW, srcHeight: srcH, quality: null, original: true, reached: true, notes: ['Already under the target, so the original file is offered unchanged.'] };
+    const stripped = await stripMetadata(file);
+    if (stripped) {
+      bitmap.close?.();
+      const note = stripped.dropped
+        ? 'Already under the target: pixels kept exactly as they were, only the metadata (EXIF, GPS, comments) was removed.'
+        : 'Already under the target and carrying no metadata, so the original file is offered unchanged.';
+      return { blob: stripped.blob, type: file.type, width: srcW, height: srcH, srcWidth: srcW, srcHeight: srcH, quality: null, original: true, reached: true, notes: [note] };
+    }
+    notes.push('Already under the target, but re-encoded once so the EXIF rotation is applied and the metadata (including GPS) is removed.');
   }
 
   // Starting size: honour the optional max width / height lock and the canvas safety limit.

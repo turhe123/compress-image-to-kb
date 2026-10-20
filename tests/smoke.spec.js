@@ -13,6 +13,34 @@ async function readDownload(download) {
 
 function isJpeg(bytes) { return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff; }
 
+// Builds a JPEG with an EXIF APP1 block (Orientation + GPS coordinates) from a baseline JPEG, so the
+// metadata-stripping tests have a fictional "phone photo" without copying anything from a real device.
+function withExif(jpeg, orientation = 1) {
+  const gpsOffset = 8 + 2 + 2 * 12 + 4;
+  const dataOffset = gpsOffset + 2 + 4 * 12 + 4;
+  const t = Buffer.alloc(dataOffset + 48);
+  t.write('MM', 0); t.writeUInt16BE(42, 2); t.writeUInt32BE(8, 4);
+  let p = 8;
+  t.writeUInt16BE(2, p); p += 2;
+  t.writeUInt16BE(0x0112, p); t.writeUInt16BE(3, p + 2); t.writeUInt32BE(1, p + 4); t.writeUInt16BE(orientation, p + 8); p += 12;
+  t.writeUInt16BE(0x8825, p); t.writeUInt16BE(4, p + 2); t.writeUInt32BE(1, p + 4); t.writeUInt32BE(gpsOffset, p + 8); p += 12;
+  t.writeUInt32BE(0, p); p += 4;
+  t.writeUInt16BE(4, p); p += 2;
+  let d = dataOffset;
+  for (const [tag, type, count, val] of [[1, 2, 2, 'N\0'], [2, 5, 3, null], [3, 2, 2, 'E\0'], [4, 5, 3, null]]) {
+    t.writeUInt16BE(tag, p); t.writeUInt16BE(type, p + 2); t.writeUInt32BE(count, p + 4);
+    if (type === 2) t.write(val, p + 8, 'ascii');
+    else { t.writeUInt32BE(d, p + 8); for (const [n, dn] of [[51, 1], [30, 1], [0, 1]]) { t.writeUInt32BE(n, d); t.writeUInt32BE(dn, d + 4); d += 8; } }
+    p += 12;
+  }
+  t.writeUInt32BE(0, p);
+  const body = Buffer.concat([Buffer.from('Exif\0\0'), t]);
+  const app1 = Buffer.concat([Buffer.from([0xff, 0xe1, (body.length + 2) >> 8, (body.length + 2) & 0xff]), body]);
+  return Buffer.concat([jpeg.subarray(0, 2), app1, jpeg.subarray(2)]);
+}
+function hasExif(bytes) { return bytes.includes('Exif'); }
+function isWebp(bytes) { return bytes.subarray(0, 4).toString('ascii') === 'RIFF' && bytes.subarray(8, 12).toString('ascii') === 'WEBP'; }
+
 async function compressSample(page) {
   await page.goto('./');
   await page.setInputFiles('#file-input', fixture('harbor-point.jpg'));
@@ -185,6 +213,99 @@ test.describe('Compress Image to Exact KB', () => {
     expect(Number(await card.getAttribute('data-size'))).toBeLessThanOrEqual(100 * KB);
     expect(requests).toEqual([]);
     await expect(page.locator('#empty-state')).toBeHidden();
+  });
+
+  test('WebP output works in the worker path and lands under the target', async ({ page }) => {
+    await page.goto('./');
+    await page.locator('#format').selectOption('webp');
+    await page.setInputFiles('#file-input', fixture('harbor-point.jpg'));
+    const card = page.locator('.kb-card').first();
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    await expect(card.locator('.alert')).toHaveCount(0);
+    const [download] = await Promise.all([page.waitForEvent('download'), card.locator('.kb-dl').click()]);
+    const bytes = await readDownload(download);
+    expect(download.suggestedFilename()).toBe('harbor-point-100kb.webp');
+    expect(isWebp(bytes)).toBe(true);
+    expect(bytes.length).toBeLessThanOrEqual(100 * KB);
+    expect(bytes.length).toBeGreaterThan(10 * KB);
+
+    // "Keep original type" with a WebP input must also produce WebP, not an error.
+    await page.locator('#clear-btn').click();
+    await page.locator('#format').selectOption('original');
+    await page.locator('label.kb-chip', { hasText: '20 KB' }).click();
+    await page.setInputFiles('#file-input', { name: 'photo.webp', mimeType: 'image/webp', buffer: bytes });
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    const [d2] = await Promise.all([page.waitForEvent('download'), card.locator('.kb-dl').click()]);
+    const out = await readDownload(d2);
+    expect(d2.suggestedFilename()).toBe('photo-20kb.webp');
+    expect(isWebp(out)).toBe(true);
+    expect(out.length).toBeLessThanOrEqual(20 * KB);
+  });
+
+  test('metadata (EXIF, GPS) is removed from every result, including files already under the target', async ({ page }) => {
+    const source = fs.readFileSync(fixture('sample.jpg'));
+    const tagged = withExif(source, 1);
+    expect(hasExif(tagged)).toBe(true);
+    expect(tagged.length).toBeLessThan(100 * KB);
+    await page.goto('./');
+    await page.setInputFiles('#file-input', { name: 'phone-photo.jpg', mimeType: 'image/jpeg', buffer: tagged });
+    const card = page.locator('.kb-card').first();
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    await expect(card.locator('.kb-notes')).toContainText(/metadata/i);
+    await expect(card.locator('[data-k="quality"]')).toHaveText('Unchanged original');
+    const [download] = await Promise.all([page.waitForEvent('download'), card.locator('.kb-dl').click()]);
+    const bytes = await readDownload(download);
+    expect(download.suggestedFilename()).toBe('phone-photo-100kb.jpg');
+    expect(isJpeg(bytes)).toBe(true);
+    expect(hasExif(bytes)).toBe(false);
+    expect(bytes.length).toBeLessThan(tagged.length);
+    // The picture data itself is untouched: everything from the start-of-scan marker on is identical.
+    const scan = (b) => b.subarray(b.indexOf(Buffer.from([0xff, 0xda])));
+    expect(scan(bytes).equals(scan(tagged))).toBe(true);
+
+    // A small photo whose EXIF rotates it is re-encoded instead, so it stays upright and still loses the tags.
+    await page.locator('#clear-btn').click();
+    await page.setInputFiles('#file-input', { name: 'rotated.jpg', mimeType: 'image/jpeg', buffer: withExif(source, 6) });
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    await expect(card.locator('[data-k="dims"]')).toContainText('400 × 640 px');
+    await expect(card.locator('.kb-notes')).toContainText(/rotation/);
+    const [d2] = await Promise.all([page.waitForEvent('download'), card.locator('.kb-dl').click()]);
+    const out = await readDownload(d2);
+    expect(hasExif(out)).toBe(false);
+    expect(out.length).toBeLessThanOrEqual(100 * KB);
+
+    // A large photo that is compressed normally also comes out without EXIF.
+    await page.locator('#clear-btn').click();
+    await page.setInputFiles('#file-input', { name: 'big.jpg', mimeType: 'image/jpeg', buffer: withExif(fs.readFileSync(fixture('harbor-point.jpg')), 1) });
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    const [d3] = await Promise.all([page.waitForEvent('download'), card.locator('.kb-dl').click()]);
+    expect(hasExif(await readDownload(d3))).toBe(false);
+  });
+
+  test('an empty custom target shows one error and adds no half-finished card', async ({ page }) => {
+    await page.goto('./');
+    await page.locator('#target-custom-radio').check();
+    await page.setInputFiles('#file-input', fixture('sample.jpg'));
+    await expect(page.locator('#results .alert--error')).toHaveText(/custom target size/i);
+    await expect(page.locator('.kb-card')).toHaveCount(0);
+    await page.locator('#custom-size').fill('15');
+    await page.setInputFiles('#file-input', fixture('sample.jpg'));
+    const card = page.locator('.kb-card').first();
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    expect(Number(await card.getAttribute('data-size'))).toBeLessThanOrEqual(15 * KB);
+  });
+
+  test('a conversion that makes the file bigger says so instead of claiming 0% saved', async ({ page }) => {
+    await page.goto('./');
+    await page.setInputFiles('#file-input', fixture('sample.gif'));
+    const card = page.locator('.kb-card').first();
+    await expect(card).toHaveAttribute('data-state', 'done', { timeout: 30_000 });
+    const size = Number(await card.getAttribute('data-size'));
+    expect(size).toBeGreaterThan(fs.statSync(fixture('sample.gif')).size);
+    expect(size).toBeLessThanOrEqual(100 * KB);
+    await expect(card.locator('[data-k="saved"]')).toHaveText(/grew by \d+%/);
+    await expect(card.locator('.kb-card__saved')).toHaveText(/^\+\d+%$/);
+    await expect(card.locator('.kb-notes')).toContainText(/larger than the original/);
   });
 
   test('__demo shows a finished result from the bundled sample', async ({ page }) => {

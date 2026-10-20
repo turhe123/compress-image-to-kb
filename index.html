@@ -200,7 +200,7 @@
       </details>
       <details class="faq">
         <summary>What happens to location (GPS) and camera data?</summary>
-        <p>It is removed. Every result is drawn fresh onto a canvas, which keeps only the pixels, so EXIF data such as GPS position, camera model and date is not copied. Photo rotation is applied first, so pictures stay upright.</p>
+        <p>It is removed from every result. Compressed photos are drawn fresh onto a canvas, which keeps only the pixels, so EXIF data such as GPS position, camera model and date is not copied; rotation is applied first, so pictures stay upright. A photo that is already under the target keeps its pixels untouched, and the metadata segments are cut out of the file instead.</p>
       </details>
       <details class="faq">
         <summary>Is it really free?</summary>
